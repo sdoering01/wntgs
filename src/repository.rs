@@ -1,6 +1,6 @@
 use nanoid::nanoid;
 use sqlx::FromRow;
-use tokio::try_join;
+use tokio::{join, try_join};
 use tracing::log::warn;
 
 use crate::users::{AppUserId, GithubUserInfo, User};
@@ -90,12 +90,31 @@ impl Repository {
         ).bind(id).fetch_one(&self.pool).await;
 
         if maybe_shortened_url.is_ok() {
-            if let Err(e) = sqlx::query("INSERT INTO redirects(time, url_id) VALUES (now(), $1)")
-                .bind(id)
-                .execute(&self.pool)
-                .await
-            {
-                warn!("error while inserting redirect: {}", e);
+            let shortened_url_update =
+                sqlx::query("UPDATE shortened_urls SET total_clicks = total_clicks + 1 WHERE id = $1")
+                    .bind(id)
+                    .execute(&self.pool);
+
+            let redirect_insert =
+                sqlx::query("INSERT INTO redirects(time, url_id) VALUES (now(), $1)")
+                    .bind(id)
+                    .execute(&self.pool);
+
+            let (shortened_url_update_result, redirect_insert_result) =
+                join!(shortened_url_update, redirect_insert);
+
+            if shortened_url_update_result.is_err() {
+                warn!(
+                    "error while updating shortened url: {}",
+                    shortened_url_update_result.unwrap_err()
+                );
+            }
+
+            if redirect_insert_result.is_err() {
+                warn!(
+                    "error while inserting redirect: {}",
+                    redirect_insert_result.unwrap_err()
+                );
             }
         }
         maybe_shortened_url
@@ -132,30 +151,21 @@ impl Repository {
         const QUERY_PER_HOUR: &str = r#"
             SELECT
                 CAST(date_trunc('second', time_series) AS TEXT) AS bucket,
-                COUNT(r.*) AS clicks
+                COALESCE(r.clicks, 0) AS clicks
             FROM
                 generate_series(
-                    date_trunc('hour', now()) - '1 day'::interval,
-                    date_trunc('hour', now() - '1 hour'::interval),
-                    '1 hour'::interval
+                    date_trunc('hour', now()) - '1 day'::INTERVAL,
+                    date_trunc('hour', now() - '1 hour'::INTERVAL),
+                    '1 hour'::INTERVAL
                 ) AS time_series
             LEFT JOIN
-                redirects r ON time_series = time_bucket('1 hour', r.time)
+                redirects_hourly r ON time_series = r.hour
                     AND url_id = $1  -- Don't use `where` so that we keep empty buckets
-            GROUP BY
-                bucket
             ORDER BY
                 bucket
         "#;
 
-        const QUERY_TOTAL: &str = r#"
-            SELECT
-                COUNT(*) AS clicks
-            FROM
-                redirects
-            WHERE
-                url_id = $1
-        "#;
+        const QUERY_TOTAL: &str = r#"SELECT total_clicks FROM shortened_urls WHERE id = $1"#;
 
         let day_statistic_future = sqlx::query_as(QUERY_PER_HOUR)
             .bind(url_id)
