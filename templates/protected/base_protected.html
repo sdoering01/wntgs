@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel="stylesheet" href="/static/css/pico.min.css">
+        <title>WNTGS &bull; {% block title %}URL Shortener{% endblock %}</title>
+    </head>
+    <body class="container">
+        <nav>
+            <ul>
+                <li><a href="/">WNTGS</a></li>
+            </ul>
+            <ul>
+                <li><a href="/shorten">Shorten</a></li>
+                <li><a href="/urls">Your URLs</a></li>
+                <li><a href="/logout" role="button">Logout</a></li>
+            </ul>
+        </nav>
+        <main>
+            {% block content %}{% endblock %}
+        </main>
+    </body>
+</html>

@@ -1,4 +1,5 @@
 mod repository;
+mod users;
 mod web;
 
 use web::App;

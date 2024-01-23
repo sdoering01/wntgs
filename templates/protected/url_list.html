@@ -1,0 +1,33 @@
+{% extends "base_protected.html" %}
+
+{% block title %}Your URLs{% endblock %}
+
+{% block content %}
+    <h2>Your URLs</h2>
+
+    {% if let Some(msg) = success_message %}
+        <p>{{msg}}</p>
+    {% endif %}
+
+    {% if let Some(msg) = error_message %}
+        <p>{{msg}}</p>
+    {% endif %}
+
+    {% if active_urls.is_empty() %}
+        <p>You haven't shortened any URLs yet.</p>
+    {% else %}
+        <ul>
+            {% for url in active_urls %}
+                <li>
+                    Shortened URL: <a href="{{shortened_url_base}}{{url.id}}" target="_blank">{{shortened_url_base}}{{url.id}}</a><br />
+                    Location: <a href="{{url.location}}" target="_blank">{{url.location}}</a><br />
+                    <a href="/urls/{{url.id}}">View Details</a><br />
+                    <form action="/urls/{{url.id}}/delete" method="post">
+                        <!-- TODO: CSRF -->
+                        <input type="submit" value="Delete" />
+                    </form>
+                </li>
+            {% endfor %}
+        </ul>
+    {% endif %}
+{% endblock %}

@@ -1,0 +1,17 @@
+{% extends "base_unprotected.html" %}
+
+{% block title %}Login{% endblock %}
+
+{% block content %}
+    {% if let Some(message) = message %}
+        <span><strong>{{ message }}</strong></span>
+    {% endif %}
+
+    <form method="post">
+      <input type="submit" value="GitHub Login" />
+
+      {% if let Some(next) = next %}
+          <input type="hidden" name="next" value="{{next}}" />
+      {% endif %}
+    </form>
+{% endblock %}

@@ -1,25 +1,16 @@
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
+DROP TABLE IF EXISTS redirects_hourly;
 DROP TABLE IF EXISTS redirects;
 DROP TABLE IF EXISTS shortened_urls;
-DROP TABLE IF EXISTS user_sessions;
 DROP TABLE IF EXISTS users;
 
 CREATE TABLE users (
     id INT PRIMARY KEY,
-    name TEXT NOT NULL,
+    username TEXT NOT NULL,
     avatar_url TEXT NOT NULL,
     github_token TEXT NOT NULL
 );
-
-CREATE TABLE user_sessions (
-    id SERIAL PRIMARY KEY,
-    user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    hashed_token BYTEA NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX ix_user_sessions_user_id ON user_sessions (user_id);
-CREATE INDEX ix_user_sessions_hashed_token ON user_sessions (hashed_token);
 
 CREATE TABLE shortened_urls (
     id TEXT PRIMARY KEY,

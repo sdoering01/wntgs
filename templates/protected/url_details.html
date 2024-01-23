@@ -1,0 +1,74 @@
+{% extends "base_protected.html" %}
+
+{% block title %}URL Statistics{% endblock %}
+
+{% block content %}
+    <h2>URL Details</h2>
+
+    <p>
+        Shortened URL: <a href="{{shortened_url_base}}{{url.id}}" target="_blank">{{shortened_url_base}}{{url.id}}</a><br />
+        Location: <a href="{{url.location}}" target="_blank">{{url.location}}</a><br />
+        <form action="/urls/{{url.id}}/delete" method="post">
+            <!-- TODO: CSRF -->
+            <input type="submit" value="Delete" />
+        </form>
+    </p>
+
+    <p>Total clicks: {{statistic.total_clicks}}</p>
+
+    <p>Clicks in the last 24 hours per hour (does not include current hour)</p>
+
+    <canvas id="dayChart" width="400" height="100"></canvas>
+
+    <script src="/static/js/chart.min.js"></script>
+    <script>
+        const ctx = document.getElementById("dayChart").getContext("2d");
+
+        const labels = [
+            {% for stat in statistic.day_statistic %}
+                new Date("{{stat.bucket}}"),
+            {% endfor %}
+        ].map(date => `${date.getHours()}:00`);
+
+        const myChart = new Chart(ctx, {
+            type: "line",
+            data: {
+                labels,
+                datasets: [{
+                    label: 'Clicks',
+                    data: [
+                        {% for stat in statistic.day_statistic %}
+                            {{stat.clicks}},
+                        {% endfor %}
+                    ],
+                    backgroundColor: 'rgba(255, 99, 132, 0.2)',
+                    borderColor: 'rgba(255, 99, 132, 1)',
+                    borderWidth: 1,
+                }],
+            },
+            options: {
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        ticks: {
+                            stepSize: 1,
+                        },
+                    },
+                },
+                plugins: {
+                    legend: {
+                        display: false,
+                    },
+                    tooltip: {
+                        intersect: false,
+                    },
+                },
+                elements: {
+                    point: {
+                        pointStyle: false,
+                    },
+                },
+            },
+        });
+    </script>
+{% endblock %}

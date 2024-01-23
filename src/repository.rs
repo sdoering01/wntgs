@@ -1,46 +1,27 @@
 use nanoid::nanoid;
 use sqlx::FromRow;
+use tokio::try_join;
 use tracing::log::warn;
 
-const QUERY_GET_URL_STATISTICS: &str = "\
-SELECT
-    CAST(date_trunc('second', time_series) AS TEXT) AS bucket,
-    COUNT(r.*) AS count
-FROM
-    generate_series(
-        date_trunc('hour', now()) - INTERVAL '1 days',
-        date_trunc('hour', now()),
-        '1 hour'::interval
-    ) AS time_series
-LEFT JOIN
-    redirects r ON time_series = time_bucket('1 hour', r.time)
-        AND url_id = $1  -- Don't use `where` so that we keep empty buckets
-GROUP BY
-    bucket
-ORDER BY
-    bucket";
-
-pub type UserId = i32;
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct GithubUserInfo {
-    pub id: UserId,
-    pub login: String,
-    pub avatar_url: String,
-}
+use crate::users::{AppUserId, GithubUserInfo, User};
 
 #[derive(Debug, Clone, serde::Serialize, FromRow)]
 pub struct ShortenedUrl {
     pub id: String,
     pub location: String,
     pub deleted: bool,
-    pub user_id: UserId,
+    pub user_id: AppUserId,
+}
+
+pub struct RedirectStatistic {
+    pub total_clicks: i64,
+    pub day_statistic: Vec<RedirectStatisticEntry>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, FromRow)]
 pub struct RedirectStatisticEntry {
     pub bucket: String,
-    pub count: i64,
+    pub clicks: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -57,39 +38,33 @@ impl Repository {
         &self,
         user_info: &GithubUserInfo,
         github_token: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("INSERT INTO users (id, name, avatar_url, github_token) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET name = $2, avatar_url = $3, github_token = $4")
+    ) -> Result<User, sqlx::Error> {
+        const QUERY: &str = r#"
+            INSERT INTO
+                users (id, username, avatar_url, github_token)
+            VALUES
+                ($1, $2, $3, $4)
+            ON CONFLICT (id) DO UPDATE SET
+                username = EXCLUDED.username,
+                avatar_url = EXCLUDED.avatar_url,
+                github_token = EXCLUDED.github_token
+            RETURNING
+                id, username, avatar_url, github_token
+        "#;
+
+        sqlx::query_as(QUERY)
             .bind(user_info.id)
             .bind(&user_info.login)
             .bind(&user_info.avatar_url)
             .bind(github_token)
-            .execute(&self.pool)
-            .await?;
-
-        Ok(())
-    }
-
-    pub async fn create_session(
-        &self,
-        user_id: UserId,
-        hashed_session_token: &[u8],
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("INSERT INTO user_sessions (user_id, hashed_token) VALUES ($1, $2)")
-            .bind(user_id)
-            .bind(hashed_session_token)
-            .execute(&self.pool)
-            .await?;
-
-        Ok(())
-    }
-
-    pub async fn get_user_id_by_session_token(
-        &self,
-        hashed_session_token: &[u8],
-    ) -> Result<UserId, sqlx::Error> {
-        sqlx::query_scalar("SELECT user_id FROM user_sessions WHERE hashed_token = $1")
-            .bind(hashed_session_token)
             .fetch_one(&self.pool)
+            .await
+    }
+
+    pub async fn get_user_by_id(&self, id: AppUserId) -> Result<Option<User>, sqlx::Error> {
+        sqlx::query_as("SELECT id, username, avatar_url, github_token FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
             .await
     }
 
@@ -100,7 +75,7 @@ impl Repository {
             .await
     }
 
-    pub async fn get_all_urls(&self, user_id: UserId) -> Result<Vec<ShortenedUrl>, sqlx::Error> {
+    pub async fn get_all_urls(&self, user_id: AppUserId) -> Result<Vec<ShortenedUrl>, sqlx::Error> {
         sqlx::query_as(
             "SELECT id, location, deleted, user_id FROM shortened_urls WHERE user_id = $1",
         )
@@ -128,29 +103,75 @@ impl Repository {
 
     pub async fn create_url(
         &self,
-        user_id: UserId,
+        user_id: AppUserId,
         location: &str,
     ) -> Result<ShortenedUrl, sqlx::Error> {
+        const QUERY: &str = r#"
+            INSERT INTO
+                shortened_urls (id, location, user_id)
+            VALUES
+                ($1, $2, $3)
+            RETURNING
+                id, location, deleted, user_id
+        "#;
+
         // TODO: Try again on id conflict
         let url_id = nanoid!(10);
-        sqlx::query_as(
-            "INSERT INTO shortened_urls (id, location, user_id) VALUES ($1, $2, $3) RETURNING id, location, deleted, user_id",
-        )
-        .bind(url_id)
-        .bind(location)
-        .bind(user_id)
-        .fetch_one(&self.pool)
-        .await
+        sqlx::query_as(QUERY)
+            .bind(url_id)
+            .bind(location)
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
     }
 
     pub async fn get_url_redirect_statistic(
         &self,
         url_id: &str,
-    ) -> Result<Vec<RedirectStatisticEntry>, sqlx::Error> {
-        sqlx::query_as(QUERY_GET_URL_STATISTICS)
+    ) -> Result<RedirectStatistic, sqlx::Error> {
+        const QUERY_PER_HOUR: &str = r#"
+            SELECT
+                CAST(date_trunc('second', time_series) AS TEXT) AS bucket,
+                COUNT(r.*) AS clicks
+            FROM
+                generate_series(
+                    date_trunc('hour', now()) - '1 day'::interval,
+                    date_trunc('hour', now() - '1 hour'::interval),
+                    '1 hour'::interval
+                ) AS time_series
+            LEFT JOIN
+                redirects r ON time_series = time_bucket('1 hour', r.time)
+                    AND url_id = $1  -- Don't use `where` so that we keep empty buckets
+            GROUP BY
+                bucket
+            ORDER BY
+                bucket
+        "#;
+
+        const QUERY_TOTAL: &str = r#"
+            SELECT
+                COUNT(*) AS clicks
+            FROM
+                redirects
+            WHERE
+                url_id = $1
+        "#;
+
+        let day_statistic_future = sqlx::query_as(QUERY_PER_HOUR)
             .bind(url_id)
-            .fetch_all(&self.pool)
-            .await
+            .fetch_all(&self.pool);
+
+        let total_clicks_future = sqlx::query_scalar(QUERY_TOTAL)
+            .bind(url_id)
+            .fetch_one(&self.pool);
+
+        match try_join!(day_statistic_future, total_clicks_future) {
+            Ok((day_statistic, total_clicks)) => Ok(RedirectStatistic {
+                total_clicks,
+                day_statistic,
+            }),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn delete_url_by_id(&self, id: &str) -> Result<ShortenedUrl, sqlx::Error> {

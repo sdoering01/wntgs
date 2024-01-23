@@ -1,30 +1,33 @@
-use std::{collections::HashSet, env, net::SocketAddr, sync::Arc};
+use std::{env, net::SocketAddr, sync::Arc};
 
 use axum::{
-    extract::{Path, Query, Request, State},
+    error_handling::HandleErrorLayer,
+    extract::{Path, State},
     http::{header, StatusCode},
-    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post},
-    Extension, Json, Router,
+    routing::get,
+    BoxError,
 };
-use base64::{engine::general_purpose, Engine as _};
-use oauth2::{
-    basic::BasicClient, reqwest::async_http_client, AuthUrl, AuthorizationCode, ClientId,
-    ClientSecret, CsrfToken, RedirectUrl, TokenResponse, TokenUrl,
-};
-use rand::RngCore;
-use reqwest::header::{HeaderMap, USER_AGENT};
-use sha2::Digest;
+use axum_login::{login_required, AuthManagerLayerBuilder};
+use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::Mutex;
+use time::Duration;
+use tower::ServiceBuilder;
+use tower_http::services::ServeDir;
+use tower_sessions::{cookie::SameSite, Expiry, PostgresStore, SessionManagerLayer};
 use tracing::error;
 
-use super::error::{AppError, AppResult};
-use crate::repository::{GithubUserInfo, RedirectStatisticEntry, Repository, ShortenedUrl, UserId};
+use crate::{
+    repository::{Repository, ShortenedUrl},
+    users::Backend,
+    web::{auth, oauth, protected},
+};
+
+pub const URL_REDIRECT_PREFIX: &str = "/u/";
 
 pub struct App {
     state: AppState,
+    session_store: PostgresStore,
 }
 
 impl App {
@@ -33,6 +36,7 @@ impl App {
         let _ = dotenvy::dotenv();
 
         let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let public_base_url = env::var("PUBLIC_BASE_URL").expect("PUBLIC_BASE_URL must be set");
 
         // TODO: What pool size is optimal?
         let pool = PgPoolOptions::new()
@@ -40,18 +44,44 @@ impl App {
             .connect(&database_url)
             .await?;
 
-        let repo = Repository::new(pool);
+        let repo = Repository::new(pool.clone());
 
         let github_oauth_client = create_github_oauth_client()?;
 
-        let state = AppState::new(repo, github_oauth_client);
-        Ok(Self { state })
+        let session_store = PostgresStore::new(pool);
+        session_store.migrate().await?;
+
+        let state = AppState::new(repo, github_oauth_client, public_base_url);
+        Ok(Self {
+            state,
+            session_store,
+        })
     }
 
     pub async fn serve(self) -> Result<(), Box<dyn std::error::Error>> {
-        let app = Router::new()
-            .nest("/api", make_api_router(self.state.clone()))
-            .route("/:url_id", get(redirect))
+        let session_layer = SessionManagerLayer::new(self.session_store)
+            .with_secure(!cfg!(debug_assertions))
+            // Required to send cookie on OAuth redirect
+            .with_same_site(SameSite::Lax)
+            .with_expiry(Expiry::OnInactivity(Duration::days(1)));
+
+        let backend = Backend::new(
+            self.state.repo.clone(),
+            self.state.github_oauth_client.as_ref().clone(),
+        );
+        let auth_service = ServiceBuilder::new()
+            .layer(HandleErrorLayer::new(|_: BoxError| async {
+                StatusCode::BAD_REQUEST
+            }))
+            .layer(AuthManagerLayerBuilder::new(backend, session_layer).build());
+
+        let app = protected::router(self.state.clone())
+            .route_layer(login_required!(Backend, login_url = "/login"))
+            .merge(auth::router())
+            .merge(oauth::router())
+            .route("/u/:url_id", get(redirect))
+            .layer(auth_service)
+            .nest_service("/static", ServeDir::new("static"))
             .with_state(self.state);
 
         let addr = SocketAddr::from(([127, 0, 0, 1], 7208));
@@ -62,36 +92,24 @@ impl App {
 }
 
 #[derive(Debug, Clone)]
-struct AppState {
-    repo: Repository,
-    github_oauth_client: Arc<BasicClient>,
-    github_csrf_states: Arc<Mutex<HashSet<String>>>,
+pub struct AppState {
+    pub repo: Repository,
+    pub github_oauth_client: Arc<BasicClient>,
+    pub shortened_url_base: Arc<str>,
 }
 
 impl AppState {
-    fn new(repo: Repository, github_oauth_client: BasicClient) -> Self {
+    fn new(
+        repo: Repository,
+        github_oauth_client: BasicClient,
+        public_base_url: impl Into<String>,
+    ) -> Self {
         AppState {
             repo,
             github_oauth_client: Arc::new(github_oauth_client),
-            github_csrf_states: Arc::new(Mutex::new(HashSet::new())),
+            shortened_url_base: Arc::from(public_base_url.into() + URL_REDIRECT_PREFIX),
         }
     }
-}
-
-#[derive(Clone, Debug, serde::Deserialize)]
-struct GithubCallbackParams {
-    code: String,
-    state: String,
-}
-
-#[derive(serde::Deserialize)]
-struct ShortenUrl {
-    location: String,
-}
-
-#[derive(Debug, Clone)]
-struct CurrentUser {
-    id: UserId,
 }
 
 fn create_github_oauth_client() -> Result<BasicClient, Box<dyn std::error::Error>> {
@@ -104,7 +122,7 @@ fn create_github_oauth_client() -> Result<BasicClient, Box<dyn std::error::Error
     let token_url =
         TokenUrl::new("https:/github.com/login/oauth/access_token".to_string()).unwrap();
 
-    let redirect_path = "/api/auth/github/callback";
+    let redirect_path = "/oauth/github/callback";
     let redirect_uri = RedirectUrl::new(if cfg!(debug_assertions) {
         format!("http://127.0.0.1:7208{}", redirect_path)
     } else {
@@ -120,105 +138,6 @@ fn create_github_oauth_client() -> Result<BasicClient, Box<dyn std::error::Error
     .set_redirect_uri(redirect_uri);
 
     Ok(client)
-}
-
-fn make_api_router(state: AppState) -> Router<AppState> {
-    let auth_router = Router::new()
-        .route("/github/login", get(github_login))
-        .route("/github/callback", get(github_callback));
-
-    let url_router = Router::new()
-        .route("/", get(get_all_urls))
-        .route("/", post(shorten))
-        .nest(
-            "/:id",
-            Router::new()
-                .route("/", get(get_url))
-                .route("/", delete(delete_url))
-                .route("/redirect-statistic", get(redirect_statistic))
-                .route_layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    check_user_url_access,
-                )),
-        )
-        .route_layer(middleware::from_fn_with_state(state, authenticate_user));
-
-    Router::new()
-        .nest("/auth", auth_router)
-        .nest("/url", url_router)
-}
-
-async fn check_user_url_access(
-    State(state): State<AppState>,
-    Extension(user): Extension<CurrentUser>,
-    Path(url_id): Path<String>,
-    req: Request,
-    next: Next,
-) -> AppResult<Response> {
-    match state.repo.get_url_by_id(&url_id).await {
-        Ok(ShortenedUrl { user_id, .. }) if user.id == user_id => Ok(next.run(req).await),
-        Ok(_) => Err(AppError::Unauthorized),
-        Err(sqlx::Error::RowNotFound) => Err(AppError::UrlNotFound),
-        Err(e) => {
-            error!("error while checking user access to url: {}", e);
-            Err(AppError::InternalServerError)
-        }
-    }
-}
-
-async fn authenticate_user(
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> AppResult<Response> {
-    let session_token = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .ok_or(AppError::NotLoggedIn)?
-        .to_str()
-        .map_err(|_| AppError::InvalidAuthorizationHeader)?
-        .strip_prefix("Bearer ")
-        .ok_or(AppError::InvalidAuthorizationHeader)?;
-
-    if session_token.is_empty() {
-        return Err(AppError::InvalidAuthorizationHeader);
-    }
-
-    let hashed_session_token = hash_session_token(session_token);
-    let user_id = state
-        .repo
-        .get_user_id_by_session_token(&hashed_session_token)
-        .await
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => AppError::SessionExpired,
-            _ => {
-                error!("error while getting user by session token: {}", e);
-                AppError::InternalServerError
-            }
-        })?;
-
-    req.extensions_mut().insert(CurrentUser { id: user_id });
-
-    Ok(next.run(req).await)
-}
-
-fn get_random_bytes<const L: usize>() -> [u8; L] {
-    let mut bytes = [0; L];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    bytes
-}
-
-fn hash_session_token(token: &str) -> Vec<u8> {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(token);
-    hasher.finalize().to_vec()
-}
-
-fn generate_session_token() -> (String, Vec<u8>) {
-    let token_bytes = get_random_bytes::<32>();
-    let token = general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
-    let hashed_token = hash_session_token(&token);
-    (token, hashed_token)
 }
 
 async fn redirect(Path(url_id): Path<String>, State(state): State<AppState>) -> Response {
@@ -243,200 +162,4 @@ async fn redirect(Path(url_id): Path<String>, State(state): State<AppState>) -> 
                 .into_response()
         }
     }
-}
-
-async fn github_login(State(state): State<AppState>) -> AppResult<Response> {
-    let (authorize_url, csrf_state) = state
-        .github_oauth_client
-        .authorize_url(CsrfToken::new_random)
-        .url();
-
-    state
-        .github_csrf_states
-        .lock()
-        .await
-        .insert(csrf_state.secret().clone());
-
-    let response = (
-        StatusCode::FOUND,
-        [(header::LOCATION, authorize_url.to_string())],
-        Html(format!(
-            r#"Follow <a href="{}">this link</a> to log in via GitHub"#,
-            authorize_url
-        )),
-    )
-        .into_response();
-
-    Ok(response)
-}
-
-async fn github_callback(
-    State(app_state): State<AppState>,
-    Query(params): Query<GithubCallbackParams>,
-) -> AppResult<Response> {
-    {
-        if !app_state
-            .github_csrf_states
-            .lock()
-            .await
-            .remove(&params.state)
-        {
-            return Err(AppError::BadRequest("Invalid CSRF state".to_string()));
-        }
-    }
-
-    let code = AuthorizationCode::new(params.code);
-
-    let token = app_state
-        .github_oauth_client
-        .exchange_code(code)
-        .request_async(async_http_client)
-        .await
-        .map_err(|err| {
-            error!("error while exchanging github code: {}", err);
-            AppError::InternalServerError
-        })?;
-
-    let access_token = token.access_token();
-
-    let client = reqwest::Client::new();
-    let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, "reqwest".parse().unwrap());
-
-    let github_user_info: GithubUserInfo = client
-        .get("https://api.github.com/user")
-        .headers(headers)
-        .bearer_auth(access_token.secret())
-        .send()
-        .await
-        .map_err(|err| {
-            error!("error while getting github user info: {}", err);
-            AppError::InternalServerError
-        })?
-        .json()
-        .await
-        .map_err(|err| {
-            error!("error while parsing github user info: {}", err);
-            AppError::InternalServerError
-        })?;
-
-    app_state
-        .repo
-        .upsert_user(&github_user_info, access_token.secret())
-        .await
-        .map_err(|e| {
-            error!("error while upserting user: {}", e);
-            AppError::InternalServerError
-        })?;
-
-    let (session_token, hashed_session_token) = generate_session_token();
-
-    app_state
-        .repo
-        .create_session(github_user_info.id, &hashed_session_token)
-        .await
-        .map_err(|e| {
-            error!("error while creating session: {}", e);
-            AppError::InternalServerError
-        })?;
-
-    // TODO: Create better response: Redirect to frontend with token in query param, also add token
-    // in header for headless clients
-
-    let response = Html(format!(
-        "Successfully logged in via GitHub! Your GitHub user id is: {}. Your session token is: {}",
-        github_user_info.id, session_token
-    ))
-    .into_response();
-
-    Ok(response)
-}
-
-async fn get_all_urls(
-    State(state): State<AppState>,
-    Extension(user): Extension<CurrentUser>,
-) -> AppResult<Json<Vec<ShortenedUrl>>> {
-    state
-        .repo
-        .get_all_urls(user.id)
-        .await
-        .map(Json)
-        .map_err(|e| {
-            error!("error while getting all urls: {}", e);
-            AppError::InternalServerError
-        })
-}
-
-async fn shorten(
-    State(state): State<AppState>,
-    Extension(user): Extension<CurrentUser>,
-    Json(payload): Json<ShortenUrl>,
-) -> AppResult<Json<ShortenedUrl>> {
-    if reqwest::Url::parse(&payload.location).is_err() {
-        return Err(AppError::BadRequest("Invalid URL".to_string()));
-    }
-
-    state
-        .repo
-        .create_url(user.id, &payload.location)
-        .await
-        .map(Json)
-        .map_err(|e| {
-            error!("error while shortening url: {}", e);
-            AppError::InternalServerError
-        })
-}
-
-async fn get_url(
-    Path(url_id): Path<String>,
-    State(state): State<AppState>,
-) -> AppResult<Json<ShortenedUrl>> {
-    state
-        .repo
-        .get_url_by_id(&url_id)
-        .await
-        .map(Json)
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => AppError::UrlNotFound,
-            _ => {
-                error!("error while getting url: {}", e);
-                AppError::InternalServerError
-            }
-        })
-}
-
-async fn delete_url(
-    Path(url_id): Path<String>,
-    State(state): State<AppState>,
-) -> AppResult<Json<ShortenedUrl>> {
-    state
-        .repo
-        .delete_url_by_id(&url_id)
-        .await
-        .map(Json)
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => AppError::UrlNotFound,
-            _ => {
-                error!("error while deleting url: {}", e);
-                AppError::InternalServerError
-            }
-        })
-}
-
-async fn redirect_statistic(
-    Path(url_id): Path<String>,
-    State(state): State<AppState>,
-) -> AppResult<Json<Vec<RedirectStatisticEntry>>> {
-    state
-        .repo
-        .get_url_redirect_statistic(&url_id)
-        .await
-        .map(Json)
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => AppError::UrlNotFound,
-            _ => {
-                error!("error while getting url redirect statistic: {}", e);
-                AppError::InternalServerError
-            }
-        })
 }
